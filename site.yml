@@ -387,6 +387,11 @@
     - name: Restart Splunk to Apply License
       command: /opt/splunk/bin/splunk restart
 
+    - name: Pause
+      run_once: true
+      pause:
+        seconds: 20
+
 - hosts: all_splunk
   gather_facts: no
   become: yes
@@ -411,6 +416,11 @@
       become_user: root
       command:
         cmd: /opt/splunk/bin/splunk restart
+    
+    - name: Pause
+      run_once: true
+      pause:
+        seconds: 20
 
 - name: Configure Splunk Users and Search Server
   hosts: all_splunk:!IFs  # Exclude Intermediate Forwarders (IFs), SH2, and SH3 manually
@@ -441,55 +451,56 @@
       become_user: root
       command:
         cmd: /opt/splunk/bin/splunk restart 
+    
+    - name: Pause
+      run_once: true
+      pause:
+        seconds: 20
 
-- name: Add all components as search peers to Management Server
-  hosts: Management_server  # Run only on Management Server
+- name: Add all Splunk components as search peers to Management Server
+  hosts: Management_server
   become: yes
   vars:
-    components_dict: >-
-      {{
-        indexers | combine(search_heads) | combine({"ClusterMaster": ClusterMaster}) |
-        combine({"Management_server": Management_server}) | combine({"Management_server": Management_server}) |
-        combine(IFs)
-      }}
-    components_ips: >-
-      {{
-        components_dict | dict2items
-        | rejectattr('key', 'equalto', 'Management_server')
-        | rejectattr('key', 'equalto', 'IF1')
-        | rejectattr('key', 'equalto', 'IF2')
-        | list
-      }}
-  tasks:
+    # Create a list of all components with their IPs
+    all_components: >-
+      [
+        {"name": "ClusterMaster", "ip": "{{ ClusterMaster.private_ip }}"},
+        {% for indexer in indexers.values() %}
+          {"name": "Indexer_{{ loop.index }}", "ip": "{{ indexer.private_ip }}"},
+        {% endfor %}
+        {% for sh in search_heads.values() %}
+          {"name": "SearchHead_{{ loop.index }}", "ip": "{{ sh.private_ip }}"},
+        {% endfor %}
+        {"name": "IndexerCluster", "ip": "{{ IFs.private_ip }}"}
+      ]
 
-    - name: Debug components (name and IP)
+  tasks:
+    - name: Display components to be added as search peers
       debug:
-        msg: "{{ item.key }} → {{ item.value.private_ip }}"
-      loop: "{{ components_ips }}"
+        msg: "Adding {{ item.ip }} ({{ item.name }}) as search peer"
+      loop: "{{ all_components }}"
 
     - name: Get list of existing search peers
       command: "/opt/splunk/bin/splunk list search-server -auth admin:{{ splunk_admin_password }}"
       register: existing_peers
       changed_when: false
-      failed_when: existing_peers.rc != 0
+      failed_when: false
 
-    - name: Debug existing search peers
-      debug:
-        msg: "{{ existing_peers.stdout_lines }}"
+    - name: Add components as search peers (if not already added)
+      command: >-
+        /opt/splunk/bin/splunk add search-server https://{{ item.ip }}:8089
+        -auth admin:{{ splunk_admin_password }}
+        -remoteUsername admin
+        -remotePassword "{{ splunk_admin_password }}"
+      loop: "{{ all_components }}"
+      when: >-
+        item.ip not in (existing_peers.stdout | default(''))
+      register: add_peer_results
+      changed_when: >-
+        "'already exists' not in add_peer_results.results[ansible_loop.index0].stdout"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Add each component as a search peer if not already added
-      command: >
-        /opt/splunk/bin/splunk add search-server https://{{ item.value.private_ip }}:8089 
-        -auth admin:{{ splunk_admin_password }} 
-        -remoteUsername service_admin 
-        -remotePassword SoftMania123
-      loop: "{{ components_ips }}"
-      when: "item.value.private_ip not in existing_peers.stdout"
-      register: add_search_server_result
-      changed_when: "'already exists' not in add_search_server_result.stderr"
-
-    - name: Restart components
-      become: yes
-      become_user: root
-      command:
-        cmd: /opt/splunk/bin/splunk restart
+    - name: Restart Splunk if any new peers were added
+      command: /opt/splunk/bin/splunk restart
+      when: add_peer_results is changed
